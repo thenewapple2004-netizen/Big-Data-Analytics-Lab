@@ -28,7 +28,7 @@ spark = SparkSession.builder \
 
 print("✅ Spark Session started successfully!\n")
 
-# ------------------ 1️⃣ Write Sample Data to HDFS (Parquet) ------------------
+
 data = [
     Row(id=1, name="Ahmad", email="ahmad@example.com"),
     Row(id=2, name="Sara", email="sara@example.com"),
@@ -41,23 +41,23 @@ print("📦 Writing DataFrame to HDFS as Parquet...\n")
 df.write.mode("overwrite").parquet(HDFS_FILE)
 print(f"✅ Data written to HDFS path: {HDFS_FILE}\n")
 
-# ------------------ 2️⃣ Read Data from HDFS (Parquet) ------------------
+
 print("📖 Reading data back from HDFS Parquet...\n")
 read_df = spark.read.parquet(HDFS_FILE)
 read_df.show(truncate=False)
 
-# ------------------ 3️⃣ Apply SparkSQL Queries ------------------
+
 read_df.createOrReplaceTempView("users")
 
-print("\n🔍 Query 1: Select all users")
+print("\n Query 1: Select all users")
 spark.sql("SELECT * FROM users").show()
 
 print("\n📧 Query 2: Select only names and emails")
 spark.sql("SELECT name, email FROM users").show()
 
-print("\n🔢 Query 3: Count total users")
+print("\n Query 3: Count total users")
 spark.sql("SELECT COUNT(*) AS total_users FROM users").show()
 
-# ------------------ Stop Spark ------------------
+
 spark.stop()
-print("🏁 Spark job completed successfully!")
+print(" Spark job completed successfully!")
