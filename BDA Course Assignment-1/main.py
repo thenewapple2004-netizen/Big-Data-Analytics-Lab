@@ -1,232 +1,108 @@
 import os
+import json
+import posixpath
 from uuid import uuid4
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType
-from pyspark.sql.functions import col, when
+from hdfs import InsecureClient
 from dotenv import load_dotenv
 
 load_dotenv()
 
+HDFS_USER = os.getenv("HDFS_USER", "root")
 HDFS_HOST = os.getenv("HDFS_HOST", "localhost")
+HDFS_PORT = int(os.getenv("HDFS_PORT", "9871"))
 HDFS_BASE_DIR = os.getenv("HDFS_BASE_DIR", "/users")
-HDFS_USERS_PARQUET = f"hdfs://{HDFS_HOST}:9000{HDFS_BASE_DIR}/users.parquet"
+HDFS_USERS_FILE = posixpath.join(HDFS_BASE_DIR, "users.json")
 
-# Define schema for users table
-USER_SCHEMA = StructType([
-    StructField("id", StringType(), False),
-    StructField("name", StringType(), False),
-    StructField("email", StringType(), False)
-])
-
-def create_spark_session():
-    """Create and return a SparkSession configured for HDFS"""
-    print(f"\n🔗 Creating SparkSession and connecting to HDFS at hdfs://{HDFS_HOST}:9000 ...")
+def connect_to_hdfs():
+    url = f"http://{HDFS_HOST}:{HDFS_PORT}"
+    print(f"\nAttempting to connect to HDFS at {url} ...")
     try:
-        spark = SparkSession.builder \
-            .appName("HDFS_Parquet_CRUD") \
-            .config("spark.master", "local[*]") \
-            .config("spark.hadoop.fs.defaultFS", f"hdfs://{HDFS_HOST}:9000") \
-            .config("spark.hadoop.dfs.client.use.datanode.hostname", "true") \
-            .getOrCreate()
-        
-        # Test HDFS connection by creating base directory if needed
-        hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
-        fs = spark.sparkContext._jvm.org.apache.hadoop.fs.FileSystem.get(
-            spark.sparkContext._jvm.java.net.URI(f"hdfs://{HDFS_HOST}:9000"),
-            hadoop_conf
-        )
-        
-        # Create base directory if it doesn't exist
-        base_path = spark.sparkContext._jvm.org.apache.hadoop.fs.Path(HDFS_BASE_DIR)
-        if not fs.exists(base_path):
-            fs.mkdirs(base_path)
-            print(f"✅ Created HDFS directory: {HDFS_BASE_DIR}")
-        
-        print("✅ SUCCESS: SparkSession created and connected to HDFS!")
-        return spark
+        client = InsecureClient(url, user=HDFS_USER)
+        client.makedirs(HDFS_BASE_DIR)
+        if not client.status(HDFS_USERS_FILE, strict=False):
+            with client.write(HDFS_USERS_FILE, overwrite=True, encoding="utf-8") as w:
+                json.dump([], w)
+        print("Connected to HDFS successfully!")
+        return client
     except Exception as e:
-        print(f"❌ ERROR: Spark/HDFS connection failed:\n{e}")
-        print("\n💡 Troubleshooting:")
-        print("1️⃣ docker compose up -d")
-        print("2️⃣ Wait for all services to start (namenode, datanode, spark-master, spark-worker)")
-        print("3️⃣ Check HDFS: http://localhost:9871")
-        print("4️⃣ Check Spark: http://localhost:8080")
-        print("5️⃣ docker ps / docker logs <container_name>")
+        print(f"ERROR: HDFS connection failed:\n{e}")
+        print("\nTroubleshooting:")
+        print("1. docker compose up -d")
+        print("2. Open http://localhost:9871")
+        print("3. docker ps / docker logs HDFS")
         exit(1)
 
-def _load_users_df(spark):
-    """Load users DataFrame from Parquet file on HDFS"""
+def _load_all_users(client):
     try:
-        df = spark.read.parquet(HDFS_USERS_PARQUET)
-        return df
-    except Exception as e:
-        # File doesn't exist, return empty DataFrame
-        print(f"ℹ️  Parquet file not found, creating new one...")
-        return spark.createDataFrame([], schema=USER_SCHEMA)
+        with client.read(HDFS_USERS_FILE, encoding="utf-8") as r:
+            return json.load(r)
+    except FileNotFoundError:
+        return []
 
-def _save_users_df(df):
-    """Save users DataFrame to Parquet file on HDFS"""
-    df.write.mode("overwrite").parquet(HDFS_USERS_PARQUET)
-    print(f"✅ Data saved to {HDFS_USERS_PARQUET}")
+def _save_all_users(client, users):
+    with client.write(HDFS_USERS_FILE, overwrite=True, encoding="utf-8") as w:
+        json.dump(users, w, ensure_ascii=False, indent=2)
 
-def create_user(spark, name, email):
-    """Create a new user using Spark SQL"""
-    df = _load_users_df(spark)
-    
-    # Check if user already exists using Spark SQL
-    df.createOrReplaceTempView("users")
-    existing = spark.sql(f"""
-        SELECT COUNT(*) as count 
-        FROM users 
-        WHERE name = '{name}'
-    """).collect()[0]['count']
-    
-    if existing > 0:
-        print("⚠️ User with that name already exists.")
+def create_user(client, name, email):
+    users = _load_all_users(client)
+    if any(u.get("name") == name for u in users):
+        print("User with that name already exists.")
         return
-    
-    # Create new user
-    new_user = spark.createDataFrame(
-        [(str(uuid4()), name, email)],
-        schema=USER_SCHEMA
-    )
-    
-    # Union with existing users and save
-    updated_df = df.union(new_user)
-    _save_users_df(updated_df)
-    
-    user_id = new_user.select("id").collect()[0]['id']
-    print(f"✅ Created user with ID: {user_id}")
+    user = {"id": str(uuid4()), "name": name, "email": email}
+    users.append(user)
+    _save_all_users(client, users)
+    print(f"Created: {user['id']}")
 
-def read_users(spark):
-    """Read all users using Spark SQL"""
-    df = _load_users_df(spark)
-    df.createOrReplaceTempView("users")
-    
-    result = spark.sql("""
-        SELECT id, name, email 
-        FROM users 
-        ORDER BY name
-    """)
-    
-    users = result.collect()
-    print("\n📋 All Users:")
+def read_users(client):
+    users = _load_all_users(client)
+    print("\nAll Users:")
     if not users:
         print("(no users found)")
         return
-    
-    for user in users:
-        print(f"ID: {user['id']} | Name: {user['name']} | Email: {user['email']}")
-    
-    print(f"\n📊 Total users: {len(users)}")
+    for u in users:
+        print(f"ID: {u['id']} | Name: {u['name']} | Email: {u['email']}")
 
-def update_user(spark, name, new_email):
-    """Update user email using Spark SQL"""
-    df = _load_users_df(spark)
-    df.createOrReplaceTempView("users")
-    
-    # Check if user exists
-    existing = spark.sql(f"""
-        SELECT COUNT(*) as count 
-        FROM users 
-        WHERE name = '{name}'
-    """).collect()[0]['count']
-    
-    if existing == 0:
-        print("⚠️ No user found.")
-        return
-    
-    # Update using Spark SQL with CASE WHEN
-    updated_df = df.withColumn(
-        "email",
-        when(col("name") == name, new_email).otherwise(col("email"))
-    )
-    
-    _save_users_df(updated_df)
-    print(f"✅ Updated email for '{name}' to '{new_email}'")
+def update_user(client, name, new_email):
+    users = _load_all_users(client)
+    updated = 0
+    for u in users:
+        if u.get("name") == name:
+            u["email"] = new_email
+            updated += 1
+    if updated:
+        _save_all_users(client, users)
+        print(f"Updated {updated} user(s).")
+    else:
+        print("No user found.")
 
-def delete_user(spark, name):
-    """Delete user using Spark SQL"""
-    df = _load_users_df(spark)
-    df.createOrReplaceTempView("users")
-    
-    # Check if user exists
-    existing = spark.sql(f"""
-        SELECT COUNT(*) as count 
-        FROM users 
-        WHERE name = '{name}'
-    """).collect()[0]['count']
-    
-    if existing == 0:
-        print("⚠️ No user found.")
-        return
-    
-    # Delete using Spark SQL filter
-    updated_df = df.filter(col("name") != name)
-    _save_users_df(updated_df)
-    print(f"✅ Deleted user '{name}'.")
+def delete_user(client, name):
+    users = _load_all_users(client)
+    new_users = [u for u in users if u.get("name") != name]
+    if len(new_users) != len(users):
+        _save_all_users(client, new_users)
+        print(f"Deleted '{name}'.")
+    else:
+        print("No user found.")
 
-def search_user(spark, name):
-    """Search user by name using Spark SQL"""
-    df = _load_users_df(spark)
-    df.createOrReplaceTempView("users")
-    
-    result = spark.sql(f"""
-        SELECT id, name, email 
-        FROM users 
-        WHERE name = '{name}'
-    """)
-    
-    users = result.collect()
-    if not users:
-        print("⚠️ No user found.")
-        return
-    
-    user = users[0]
-    print("\n✅ Found:")
-    print(f"ID: {user['id']}")
-    print(f"Name: {user['name']}")
-    print(f"Email: {user['email']}")
-
-def query_users_spark_sql(spark):
-    """Demonstrate additional Spark SQL queries"""
-    df = _load_users_df(spark)
-    df.createOrReplaceTempView("users")
-    
-    print("\n📊 Spark SQL Analytics:")
-    print("=" * 50)
-    
-    # Count total users
-    total = spark.sql("SELECT COUNT(*) as total FROM users").collect()[0]['total']
-    print(f"Total Users: {total}")
-    
-    # Count users by email domain
-    print("\nUsers by Email Domain:")
-    domain_count = spark.sql("""
-        SELECT 
-            SUBSTRING_INDEX(email, '@', -1) as domain,
-            COUNT(*) as count
-        FROM users
-        GROUP BY domain
-        ORDER BY count DESC
-    """)
-    domain_count.show(truncate=False)
-    
-    # Show sample data
-    print("\nSample Data (first 5 users):")
-    spark.sql("SELECT * FROM users LIMIT 5").show(truncate=False)
+def search_user(client, name):
+    users = _load_all_users(client)
+    for u in users:
+        if u.get("name") == name:
+            print("\nFound:")
+            print(f"ID: {u['id']}\nName: {u['name']}\nEmail: {u['email']}")
+            return
+    print("No user found.")
 
 def display_menu():
     print("\n" + "=" * 50)
-    print("     HDFS PARQUET + SPARK SQL CRUD OPERATIONS")
+    print("HDFS CRUD OPERATIONS MENU")
     print("=" * 50)
     print("1. Create User")
     print("2. Read All Users")
     print("3. Update User Email")
     print("4. Delete User")
     print("5. Search User by Name")
-    print("6. Spark SQL Analytics")
-    print("7. Exit")
+    print("6. Exit")
     print("=" * 50)
 
 def get_user_input(prompt):
@@ -237,60 +113,43 @@ def get_user_input(prompt):
         exit()
 
 def main():
-    print("\n🚀 Starting HDFS Parquet + Spark SQL CRUD Operations...\n")
-    spark = create_spark_session()
-    
-    try:
-        while True:
-            display_menu()
-            choice = get_user_input("\nEnter your choice (1-7): ")
-            
-            if choice == "1":
-                name = get_user_input("Enter user name: ")
-                email = get_user_input("Enter user email: ")
-                if name and email:
-                    create_user(spark, name, email)
-                else:
-                    print("⚠️ Name and email required.")
-            
-            elif choice == "2":
-                read_users(spark)
-            
-            elif choice == "3":
-                name = get_user_input("User name to update: ")
-                new_email = get_user_input("New email: ")
-                if name and new_email:
-                    update_user(spark, name, new_email)
-                else:
-                    print("⚠️ Name and new email required.")
-            
-            elif choice == "4":
-                name = get_user_input("User name to delete: ")
-                confirm = get_user_input(f"Delete '{name}'? (y/N): ")
-                if confirm.lower() in ["y", "yes"]:
-                    delete_user(spark, name)
-                else:
-                    print("Cancelled.")
-            
-            elif choice == "5":
-                name = get_user_input("User name to search: ")
-                search_user(spark, name)
-            
-            elif choice == "6":
-                query_users_spark_sql(spark)
-            
-            elif choice == "7":
-                print("\n👋 Goodbye!")
-                break
-            
+    print("\nStarting HDFS CRUD Operations...\n")
+    client = connect_to_hdfs()
+    while True:
+        display_menu()
+        choice = get_user_input("\nEnter your choice (1-6): ")
+        if choice == "1":
+            name = get_user_input("Enter user name: ")
+            email = get_user_input("Enter user email: ")
+            if name and email:
+                create_user(client, name, email)
             else:
-                print("⚠️ Enter a number 1–7.")
-            
-            input("\nPress Enter to continue...")
-    
-    finally:
-        spark.stop()
-        print("\n✅ SparkSession stopped.")
+                print("Name and email required.")
+        elif choice == "2":
+            read_users(client)
+        elif choice == "3":
+            name = get_user_input("User name to update: ")
+            new_email = get_user_input("New email: ")
+            if name and new_email:
+                update_user(client, name, new_email)
+            else:
+                print("Name and new email required.")
+        elif choice == "4":
+            name = get_user_input("User name to delete: ")
+            confirm = get_user_input(f"Delete '{name}'? (y/N): ")
+            if confirm.lower() in ["y", "yes"]:
+                delete_user(client, name)
+            else:
+                print("Cancelled.")
+        elif choice == "5":
+            name = get_user_input("User name to search: ")
+            search_user(client, name)
+        elif choice == "6":
+            print("\nGoodbye!")
+            break
+        else:
+            print("Enter a number 1–6.")
+        input("\nPress Enter to continue...")
 
 if __name__ == "__main__":
     main()
